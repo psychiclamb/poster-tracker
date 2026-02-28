@@ -1,5 +1,4 @@
 streamlit
-sqlalchemy
-psycopg[binary]
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
 streamlit-sortables
-
