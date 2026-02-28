@@ -11,9 +11,49 @@ from sqlalchemy import text
 
 
 # ===================== DB =====================
+TABLE_NAME = "public.artist_progress"
+
+
 def get_conn():
-    # Streamlit Cloud -> Settings -> Secrets: DB_URL = "postgresql+psycopg2://..."
+    # Streamlit Cloud -> Settings -> Secrets (TOML):
+    # DB_URL = "postgresql+psycopg://... ?sslmode=require"
     return st.connection("postgresql", type="sql", url=st.secrets["DB_URL"])
+
+
+def ensure_table_exists() -> None:
+    """
+    Non-destructive migration:
+    - Table yoksa oluşturur
+    - Eksik kolonları ekler
+    - Upsert için id unique index garanti eder
+    """
+    conn = get_conn()
+
+    ddl = [
+        f"""
+        create table if not exists {TABLE_NAME} (
+            id text primary key,
+            label text not null,
+            order_num int not null,
+            global_steps jsonb default '{{}}'::jsonb,
+            variants jsonb default '{{}}'::jsonb,
+            updated_at timestamptz default now()
+        );
+        """,
+        f"alter table {TABLE_NAME} add column if not exists id text;",
+        f"alter table {TABLE_NAME} add column if not exists label text;",
+        f"alter table {TABLE_NAME} add column if not exists order_num int;",
+        f"alter table {TABLE_NAME} add column if not exists global_steps jsonb default '{{}}'::jsonb;",
+        f"alter table {TABLE_NAME} add column if not exists variants jsonb default '{{}}'::jsonb;",
+        f"alter table {TABLE_NAME} add column if not exists updated_at timestamptz default now();",
+        # PK yoksa bile upsert on conflict (id) çalışsın:
+        f"create unique index if not exists artist_progress_id_uq on {TABLE_NAME} (id);",
+    ]
+
+    with conn.session as session:
+        for stmt in ddl:
+            session.execute(text(stmt))
+        session.commit()
 
 
 # ===================== Config =====================
@@ -33,8 +73,7 @@ COLUMN_STEPS: List[Tuple[str, str]] = [
     ("etsy_yuklendi", "Etsy'e yüklendi"),
 ]
 
-# Bu kısım artık yok (UI'da gösterilmeyecek).
-# DB şemasını bozmamak için boş bırakıyoruz.
+# UI'da yok; DB geriye uyum için boş
 GLOBAL_STEPS: List[Tuple[str, str]] = []
 
 
@@ -60,7 +99,6 @@ def norm(s: str) -> str:
 
 
 def checkbox_key(item_id: str, variant_key: Optional[str], step_key: str) -> str:
-    # global yok ama geriye uyumluluk için fonksiyonu tutuyoruz
     if variant_key is None:
         return f"{item_id}__global__{step_key}"
     return f"{item_id}__{variant_key}__{step_key}"
@@ -105,13 +143,12 @@ class TopicProgress:
     id: str
     label: str
     order: int
-    # global_steps artık kullanılmıyor ama DB geriye uyum için tutuyoruz
     global_steps: Dict[str, bool]
     variants: Dict[str, Dict[str, bool]]
 
     @staticmethod
     def new(label: str, order: int) -> "TopicProgress":
-        item_id = uuid.uuid4().hex
+        item_id = uuid.uuid4().hex  # text id
         variants = {vk: empty_variant_steps() for vk, _ in VARIANTS}
         return TopicProgress(
             id=item_id,
@@ -124,12 +161,14 @@ class TopicProgress:
 
 # ===================== DB CRUD =====================
 def load_data() -> Dict[str, TopicProgress]:
+    ensure_table_exists()
+
     conn = get_conn()
     data: Dict[str, TopicProgress] = {}
 
     with conn.session as session:
         rows = session.execute(
-            text("select id, label, order_num, global_steps, variants from artist_progress")
+            text(f"select id, label, order_num, global_steps, variants from {TABLE_NAME} order by order_num asc")
         ).mappings().all()
 
     for r in rows:
@@ -137,9 +176,8 @@ def load_data() -> Dict[str, TopicProgress]:
         label = str(r["label"]).strip()
         order = int(r["order_num"])
 
-        # global kullanılmıyor; yine de okuyup dict'e çeviriyoruz (boş olabilir)
-        g_in = _safe_json_to_dict(r["global_steps"])
-        v_in = _safe_json_to_dict(r["variants"])
+        g_in = _safe_json_to_dict(r.get("global_steps"))
+        v_in = _safe_json_to_dict(r.get("variants"))
 
         variants: Dict[str, Dict[str, bool]] = {}
         for vk, _ in VARIANTS:
@@ -163,10 +201,11 @@ def load_data() -> Dict[str, TopicProgress]:
 
 
 def save_data(data: Dict[str, TopicProgress]) -> None:
+    ensure_table_exists()
     conn = get_conn()
 
-    upsert_sql = text("""
-        insert into artist_progress (id, label, order_num, global_steps, variants, updated_at)
+    upsert_sql = text(f"""
+        insert into {TABLE_NAME} (id, label, order_num, global_steps, variants, updated_at)
         values (:id, :label, :order_num, cast(:global_steps as jsonb), cast(:variants as jsonb), now())
         on conflict (id) do update set
             label = excluded.label,
@@ -184,7 +223,7 @@ def save_data(data: Dict[str, TopicProgress]) -> None:
                     "id": ap.id,
                     "label": ap.label,
                     "order_num": ap.order,
-                    "global_steps": json.dumps({}, ensure_ascii=False),  # kullanılmıyor
+                    "global_steps": json.dumps({}, ensure_ascii=False),
                     "variants": json.dumps(ap.variants, ensure_ascii=False),
                 },
             )
@@ -192,16 +231,19 @@ def save_data(data: Dict[str, TopicProgress]) -> None:
 
 
 def delete_item_db(item_id: str) -> None:
+    ensure_table_exists()
     conn = get_conn()
     with conn.session as session:
-        session.execute(text("delete from artist_progress where id = :id"), {"id": item_id})
+        session.execute(text(f"delete from {TABLE_NAME} where id = :id"), {"id": item_id})
         session.commit()
 
 
-def truncate_all_db() -> None:
+def clear_all_rows_db() -> None:
+    """Tabloyu silmez, sadece satırları temizler."""
+    ensure_table_exists()
     conn = get_conn()
     with conn.session as session:
-        session.execute(text("truncate table artist_progress"))
+        session.execute(text(f"delete from {TABLE_NAME}"))
         session.commit()
 
 
@@ -349,10 +391,27 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.button("🧨 Her şeyi sıfırla (DB)", use_container_width=True, key="btn_reset_all"):
-        truncate_all_db()
-        st.success("Sıfırlandı.")
-        st.stop()
+    st.header("🧨 Sıfırlama")
+    if "reset_all_confirm" not in st.session_state:
+        st.session_state["reset_all_confirm"] = False
+
+    if not st.session_state["reset_all_confirm"]:
+        if st.button("Tüm satırları sil (DB)", use_container_width=True):
+            st.session_state["reset_all_confirm"] = True
+            force_rerun()
+    else:
+        st.warning("Bu işlem tüm kayıtları silecek. Emin misin?")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Evet, sil", use_container_width=True):
+                clear_all_rows_db()
+                st.session_state["reset_all_confirm"] = False
+                st.success("Tüm satırlar silindi.")
+                st.stop()
+        with c2:
+            if st.button("Vazgeç", use_container_width=True):
+                st.session_state["reset_all_confirm"] = False
+                force_rerun()
 
 
 # ======= Main list =======
@@ -462,7 +521,6 @@ for ap in items:
         st.markdown("**Poster (Dikey):**")
         changed = False
 
-        # Tek varyant: dikey
         vk = "dikey"
         for sk, slabel in COLUMN_STEPS:
             k = checkbox_key(item_id, vk, sk)
